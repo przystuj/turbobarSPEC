@@ -1,7 +1,7 @@
 function widget:GetInfo()
     return {
-        name = "Spectator Events Tracker",
-        desc = "Provides a prioritized list of game events for spectators/casters",
+        name = "Tactical Ultra-Responsive Broadcast Optimization for BAR Spectators",
+        desc = "Tracks the action so you don’t have to.",
         author = "SuperKitowiec",
         date = "April 2025",
         license = "GNU GPL, v2 or later",
@@ -19,9 +19,9 @@ local CommonModules = VFS.Include("LuaUI/TurboBarSpec/common.lua")
 local Log = CommonModules.Log
 local Util = CommonModules.Util
 local CONFIG = WidgetContext.CONFIG
+local STATE = WidgetContext.STATE
 
 -- Reference to shared state
-local STATE = WidgetContext.STATE
 local commanderUnits = STATE.commanderUnits
 local lastCommanderHealth = STATE.lastCommanderHealth
 local eventQueue = STATE.eventQueue
@@ -245,17 +245,35 @@ end
 
 -- Add drawing function to visualize events (optional, for debugging)
 function widget:DrawWorld()
-    -- Uncomment this for debugging
-    -- for _, event in ipairs(eventQueue) do
-    --     if event.location then
-    --         gl.PushMatrix()
-    --         gl.Translate(event.location.x, event.location.y, event.location.z)
-    --         gl.Color(1, 0, 0, 0.5)
-    --         gl.Sphere(100, 20, 20)
-    --         gl.PopMatrix()
-    --     end
-    -- end
-end
+    -- Check if the gl functions we need are available
+    if not gl then return end
 
--- Return the widget table
-return widget
+    -- Verify all required functions exist before using them
+    if not (gl.PushMatrix and gl.PopMatrix and gl.Translate and gl.Color and
+            gl.LineWidth and gl.DrawGroundCircle) then
+        return
+    end
+
+    for _, event in ipairs(eventQueue) do
+        if event.location then
+            -- Draw colored circles on the ground instead of spheres
+            local color = {1, 0, 0, 0.5} -- Default red
+
+            -- Different colors for different event types
+            if event.type == "COMMANDER_CRITICAL" then
+                color = {1, 0, 0, 0.7} -- Bright red for critical
+            elseif event.type == "COMMANDER_LOW_HEALTH" then
+                color = {1, 0.5, 0, 0.7} -- Orange for low health
+            elseif event.type == "COMMANDER_DESTROYED" then
+                color = {0.7, 0, 0, 0.8} -- Dark red for destroyed
+            end
+
+            gl.LineWidth(2.0)
+            gl.Color(color[1], color[2], color[3], color[4])
+
+            -- Draw a circle on the ground - safer than trying to use Sphere
+            local radius = 100 -- Same size as your original sphere
+            gl.DrawGroundCircle(event.location.x, event.location.y, event.location.z, radius, 30)
+        end
+    end
+end
