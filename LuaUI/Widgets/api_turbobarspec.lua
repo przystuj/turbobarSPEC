@@ -34,9 +34,13 @@ local CMD_SELFD = 65 -- Self destruct command ID
 local ENEMY_DETECTION_RANGE = 360 -- Range to check for nearby enemies (in game units)
 local SPYBOT_DETECTION_RANGE = 220 -- Range to check for enemies near spybots
 local SPYBOT_ANTINUKE_ALERT_RANGE = 600 -- Range to check for antinukes near spybots
+local ANTINUKE_COVERAGE_RANGE = 2000 -- Approximate range of antinuke defense coverage
 
 local lowHealthCommanders = {} -- Track commanders with low health
 local criticalHealthCommanders = {} -- Track commanders with critical health
+
+local activeNukes = {} -- Track active nuclear missiles
+local nextNukeID = 1 -- Counter for generating unique IDs for nuke tracks
 
 
 -- Check if a unit is a commander (local helper function)
@@ -63,27 +67,6 @@ local function checkIfCommander(unitID)
             if health and maxHealth then
                 lastCommanderHealth[unitID] = health / maxHealth
             end
-
-            Log.debug("Tracking commander: " .. unitID .. " (Team " .. teamID .. ")")
-        end
-    end
-end
-
-
-
--- Add an event to the queue (local helper function)
-local function addEvent(event)
-    table.insert(eventQueue, event)
-
-    -- Sort queue by priority (higher priority first)
-    table.sort(eventQueue, function(a, b)
-        return a.priority > b.priority
-    end)
-
-    -- Call any registered event listeners
-    for id, listener in pairs(eventListeners) do
-        if type(listener) == "function" then
-            listener(event)
         end
     end
 end
@@ -97,7 +80,9 @@ end
 -- Check if a unit is an antinuke
 local function isAntinuke(unitDefID)
     local unitDef = UnitDefs[unitDefID]
-    if not unitDef then return false end
+    if not unitDef then
+        return false
+    end
     local name = unitDef.name and unitDef.name:lower()
     return name == "armamd" or name == "corfmd" -- Common antinuke unit names
 end
@@ -157,8 +142,79 @@ local function checkForNearbyAntinuke(unitID, range)
     return false
 end
 
+-- Find all existing commanders (local helper function)
+local function findAllCommanders()
+    Log.debug("Finding all commanders...")
+    local allUnits = Spring.GetAllUnits()
+    for _, unitID in ipairs(allUnits) do
+        checkIfCommander(unitID)
+    end
+    Log.debug("Found " .. Util.tableLength(commanderUnits) .. " commanders")
+end
+
+-- Add an event to the queue (local helper function)
+local function addEvent(event)
+    table.insert(eventQueue, event)
+
+    -- Sort queue by priority (higher priority first)
+    table.sort(eventQueue, function(a, b)
+        return a.priority > b.priority
+    end)
+
+    -- Call any registered event listeners
+    for id, listener in pairs(eventListeners) do
+        if type(listener) == "function" then
+            listener(event)
+        end
+    end
+end
+
+-- Update event queue (remove expired events) (local helper function)
+local function updateEventQueue(currentFrame)
+    for i = #eventQueue, 1, -1 do
+        if eventQueue[i].expiryFrame <= currentFrame then
+            table.remove(eventQueue, i)
+        end
+    end
+end
+
 -- Regularly check for spybots near antinukes (will be called in GameFrame)
 local spybotsNearAntinuke = {} -- Track spybots that are near antinukes
+
+-- Check if a position is protected by an antinuke defense
+local function isPositionCoveredByAntinuke(position)
+    -- Get all units
+    local allUnits = Spring.GetAllUnits()
+
+    for _, unitID in ipairs(allUnits) do
+        local unitDefID = Spring.GetUnitDefID(unitID)
+
+        -- Check if it's an antinuke
+        if isAntinuke(unitDefID) then
+            -- Get position
+            local x, y, z = Spring.GetUnitPosition(unitID)
+
+            -- Check if unit is active/operational (not being built or disabled)
+            local _, _, _, _, buildProgress = Spring.GetUnitHealth(unitID)
+            local isComplete = buildProgress >= 1.0
+
+            if isComplete then
+                -- Calculate distance to the target position
+                local dx = position.x - x
+                local dz = position.z - z
+                local distSq = dx * dx + dz * dz
+
+                -- If within coverage range, it's protected
+                if distSq <= (ANTINUKE_COVERAGE_RANGE * ANTINUKE_COVERAGE_RANGE) then
+                    return true
+                end
+            end
+        end
+    end
+
+    -- No antinuke coverage found
+    return false
+end
 
 local function checkForSpybotsNearAntinukes()
     local allUnits = Spring.GetAllUnits()
@@ -211,25 +267,6 @@ local function checkForSpybotsNearAntinukes()
     for unitID in pairs(spybotsNearAntinuke) do
         if not Spring.ValidUnitID(unitID) then
             spybotsNearAntinuke[unitID] = nil
-        end
-    end
-end
-
--- Find all existing commanders (local helper function)
-local function findAllCommanders()
-    Log.debug("Finding all commanders...")
-    local allUnits = Spring.GetAllUnits()
-    for _, unitID in ipairs(allUnits) do
-        checkIfCommander(unitID)
-    end
-    Log.debug("Found " .. Util.tableLength(commanderUnits) .. " commanders")
-end
-
--- Update event queue (remove expired events) (local helper function)
-local function updateEventQueue(currentFrame)
-    for i = #eventQueue, 1, -1 do
-        if eventQueue[i].expiryFrame <= currentFrame then
-            table.remove(eventQueue, i)
         end
     end
 end
@@ -334,7 +371,7 @@ local function checkForSelfDestruct(unitID, cmdID)
                         expiryFrame = Spring.GetGameFrame() + 300, -- Show for 10 seconds
                     })
                 elseif hasEnemiesNearby then
-                    priority = 8 -- High priority if enemies nearby
+                    priority = 6 -- High priority if enemies nearby
                     eventType = "SPYBOT_ENEMY_ATTACK"
                     message = "ALERT: Spybot targeting enemies! (Team " .. teamID .. ")"
                     Log.info(message)
@@ -465,7 +502,7 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
             -- Add commander self-destruct event
             addEvent({
                 type = "COMMANDER_SELF_DESTRUCTED",
-                priority = 10, -- Highest priority
+                priority = 1,
                 unitID = unitID,
                 teamID = unitTeam,
                 location = lastPosition,
@@ -492,49 +529,147 @@ function widget:UnitDestroyed(unitID, unitDefID, unitTeam)
         lastCommanderHealth[unitID] = nil
         selfDestructingCommanders[unitID] = nil
     elseif selfDestructingSpybots[unitID] then
-        local spybotData = selfDestructingSpybots[unitID]
-        local position = spybotData.position
-        local hasAntinuke = spybotData.hasAntinukeNearby
-        local hasEnemies = spybotData.hasEnemiesNearby
-
-        -- Add spybot destroyed event with appropriate type and priority
-        local priority = 5 -- Default priority
-        local eventType = "SPYBOT_DESTROYED"
-        local message = "Spybot destroyed (Team " .. unitTeam .. ")"
-
-        if hasAntinuke then
-            priority = 10 -- Highest priority if targeted antinuke
-            eventType = "SPYBOT_ANTINUKE_DESTROYED"
-            message = "CRITICAL: Spybot destroyed Antinuke! (Team " .. unitTeam .. ")"
-            Log.info(message)
-        elseif hasEnemies then
-            priority = 8 -- High priority if targeted enemies
-            eventType = "SPYBOT_ENEMIES_DESTROYED"
-            message = "ALERT: Spybot destroyed enemies! (Team " .. unitTeam .. ")"
-            Log.info(message)
-        else
-            Log.info("Spybot destroyed: Team " .. unitTeam)
-        end
-
-        -- Add event
-        addEvent({
-            type = eventType,
-            priority = priority,
-            unitID = unitID,
-            teamID = unitTeam,
-            location = position,
-            message = message,
-            expiryFrame = Spring.GetGameFrame() + 300, -- Show for 10 seconds
-        })
-
-        -- Clean up tracking
-        selfDestructingSpybots[unitID] = nil
+        --local spybotData = selfDestructingSpybots[unitID]
+        --local position = spybotData.position
+        --local hasAntinuke = spybotData.hasAntinukeNearby
+        --local hasEnemies = spybotData.hasEnemiesNearby
+        --
+        ---- Add spybot destroyed event with appropriate type and priority
+        --local priority = 5 -- Default priority
+        --local eventType = "SPYBOT_DESTROYED"
+        --local message = "Spybot destroyed (Team " .. unitTeam .. ")"
+        --
+        --if hasAntinuke then
+        --    priority = 10 -- Highest priority if targeted antinuke
+        --    eventType = "SPYBOT_ANTINUKE_DESTROYED"
+        --    message = "CRITICAL: Spybot destroyed Antinuke! (Team " .. unitTeam .. ")"
+        --    Log.info(message)
+        --elseif hasEnemies then
+        --    priority = 8 -- High priority if targeted enemies
+        --    eventType = "SPYBOT_ENEMIES_DESTROYED"
+        --    message = "ALERT: Spybot destroyed enemies! (Team " .. unitTeam .. ")"
+        --    Log.info(message)
+        --else
+        --    Log.info("Spybot destroyed: Team " .. unitTeam)
+        --end
+        --
+        ---- Add event
+        --addEvent({
+        --    type = eventType,
+        --    priority = priority,
+        --    unitID = unitID,
+        --    teamID = unitTeam,
+        --    location = position,
+        --    message = message,
+        --    expiryFrame = Spring.GetGameFrame() + 300, -- Show for 10 seconds
+        --})
+        --
+        ---- Clean up tracking
+        --selfDestructingSpybots[unitID] = nil
     end
+end
+
+local function isNukeSilo(unitDefID)
+    local unitDef = UnitDefs[unitDefID]
+    if not unitDef then
+        return false
+    end
+    local name = unitDef.name and unitDef.name:lower()
+
+    -- Check for known nuke silo names
+    return name == "corsilo" or name == "armsilo"
 end
 
 -- Intercept unit commands to detect self-destruct
 function widget:UnitCommand(unitID, unitDefID, unitTeam, cmdID, cmdParams, cmdOpts, cmdTag)
-    checkForSelfDestruct(unitID, cmdID)
+    -- First handle self-destruct commands as before
+    if cmdID == CMD_SELFD then
+        local handled = checkForSelfDestruct(unitID, cmdID)
+        if handled then
+            return
+        end
+    end
+
+    -- Check if this is an attack command (cmdID 10)
+    -- The Attack command has ID 10 in Spring Engine
+    if cmdID == 20 and isNukeSilo(unitDefID) then
+        local currentFrame = Spring.GetGameFrame()
+        local x, y, z = Spring.GetUnitPosition(unitID)
+
+        -- Get target coordinates from command parameters
+        local targetX, targetY, targetZ
+        if cmdParams and #cmdParams >= 3 then
+            targetX, targetY, targetZ = cmdParams[1], cmdParams[2], cmdParams[3]
+        else
+            -- If we can't get target from cmdParams, check if it's attacking a unit
+            if cmdParams and #cmdParams == 1 then
+                local targetUnitID = cmdParams[1]
+                if Spring.ValidUnitID(targetUnitID) then
+                    targetX, targetY, targetZ = Spring.GetUnitPosition(targetUnitID)
+                end
+            end
+
+            -- Fallback if target coordinates not available
+            if not targetX then
+                -- Default to a position in front of the silo
+                targetX, targetZ = x + 3000, z + 3000 -- arbitrary direction
+                targetY = Spring.GetGroundHeight(targetX, targetZ)
+            end
+        end
+
+        local targetPos = { x = targetX, y = targetY, z = targetZ }
+
+        -- Check if target is covered by antinuke
+        local isCovered = isPositionCoveredByAntinuke(targetPos)
+
+        -- Generate a unique ID for this nuke launch
+        local nukeID = "nuke_" .. nextNukeID
+        nextNukeID = nextNukeID + 1
+
+        local preparationTime = 300
+
+        -- Store the nuke information
+        activeNukes[nukeID] = {
+            teamID = unitTeam,
+            position = { x = x, y = y, z = z }, -- Launch position
+            firstDetected = currentFrame,
+            targetPosition = targetPos,
+            isCovered = isCovered,
+            preparationTime = preparationTime, -- 20 seconds * 30 frames per second
+            expiryFrame = currentFrame + preparationTime, -- Preparation time + flight time
+            siloUnitID = unitID, -- Track which silo launched it
+            launchFrame = currentFrame + preparationTime -- When the nuke actually launches
+        }
+
+        -- Create appropriate event based on whether it will be intercepted
+        local priority, eventType, message
+
+        if isCovered then
+            -- Low priority for nukes that will be intercepted during preparation
+            priority = 4
+            eventType = "NUKE_LAUNCH_DETECTED"
+            message = "Nuke preparation detected (Team " .. unitTeam .. ") - Will be intercepted"
+        else
+            -- Preparation priority is 4, but becomes 8 if not intercepted
+            priority = 4
+            eventType = "NUKE_LAUNCH_LOADING"
+            message = "Nuke preparation in progress (Team " .. unitTeam .. ")"
+        end
+
+        -- Add event notification
+        addEvent({
+            type = eventType,
+            priority = priority,
+            unitID = unitID, -- The silo ID
+            teamID = unitTeam,
+            location = { x = x, y = y, z = z },
+            targetLocation = targetPos,
+            message = message,
+            expiryFrame = currentFrame + preparationTime, -- Show during preparation time
+        })
+
+        Log.info(message)
+    end
 end
 
 -- When unit is given (used for detecting commander transfers)
@@ -542,6 +677,87 @@ function widget:UnitGiven(unitID, unitDefID, newTeam, oldTeam)
     if commanderUnits[unitID] then
         commanderUnits[unitID].teamID = newTeam
         Log.debug("Commander transferred from team " .. oldTeam .. " to team " .. newTeam)
+    end
+end
+
+local function updateNukes()
+    local currentFrame = Spring.GetGameFrame()
+
+    -- Check each active nuke
+    for nukeID, nukeData in pairs(activeNukes) do
+        -- Check if nuke has launched (preparation time complete)
+        if currentFrame >= nukeData.launchFrame then
+            -- Adjust priority if not intercepted after preparation
+            if not nukeData.isCovered and not nukeData.priorityUpdated then
+                -- Increase priority to 8 for undefended nukes
+                for i, event in ipairs(eventQueue) do
+                    if event.unitID == nukeData.siloUnitID and event.type == "NUKE_LAUNCH_LOADING" then
+                        event.priority = 8
+                        event.type = "NUKE_LAUNCH_UNDEFENDED"
+                        event.message = "CRITICAL: Undefended nuke launch! (Team " .. nukeData.teamID .. ")"
+                        break
+                    end
+                end
+                nukeData.priorityUpdated = true
+            end
+
+            -- Check if nuke has reached its destination (based on flight time)
+            if currentFrame >= nukeData.expiryFrame then
+                local targetPos = nukeData.targetPosition
+                local teamID = nukeData.teamID
+
+                -- Add event for nuke detonation or interception
+                local eventType, message, priority
+
+                if nukeData.isCovered then
+                    eventType = "NUKE_INTERCEPTED"
+                    message = "Nuke intercepted (Team " .. teamID .. ")"
+                    priority = 1
+                else
+                    eventType = "NUKE_DETONATION"
+                    message = "CRITICAL: Nuclear detonation! (Team " .. teamID .. ")"
+                    priority = 10
+                end
+
+                addEvent({
+                    type = eventType,
+                    priority = priority,
+                    teamID = teamID,
+                    location = targetPos,
+                    message = message,
+                    expiryFrame = currentFrame + 600, -- Show for 10 seconds
+                })
+
+                Log.info(message)
+
+                -- Remove from tracking
+                activeNukes[nukeID] = nil
+            else
+                -- Update nuke position based on interpolation between launch and target
+                local launchPos = nukeData.position
+                local targetPos = nukeData.targetPosition
+                local totalFrames = nukeData.expiryFrame - nukeData.launchFrame
+                local elapsedFrames = currentFrame - nukeData.launchFrame
+                local progress = math.min(1.0, elapsedFrames / totalFrames)
+
+                -- Calculate current position (with arc trajectory)
+                local dx = targetPos.x - launchPos.x
+                local dz = targetPos.z - launchPos.z
+
+                -- Simple ballistic arc
+                local arcHeight = 1000 -- Maximum height of the arc
+                local arcProgress = math.sin(progress * math.pi) -- 0 to 1 to 0
+
+                local currentPos = {
+                    x = launchPos.x + dx * progress,
+                    z = launchPos.z + dz * progress,
+                    y = launchPos.y + arcHeight * arcProgress
+                }
+
+                -- Update the position
+                nukeData.currentPosition = currentPos
+            end
+        end
     end
 end
 
@@ -553,6 +769,8 @@ function widget:GameFrame(frame)
         updateEventQueue(frame)
         -- Check for spybots near antinukes every update cycle
         checkForSpybotsNearAntinukes()
+        -- Check for nukes in flight
+        updateNukes()
     end
 end
 
@@ -587,7 +805,9 @@ end
 -- Add drawing function to visualize events
 -- Draw a cylinder (local helper function)
 local function drawCylinder(x, y, z, radius, height, sides)
-    if not gl.BeginEnd then return end
+    if not gl.BeginEnd then
+        return
+    end
 
     local topY = y + height
     local bottomY = y
@@ -606,18 +826,64 @@ local function drawCylinder(x, y, z, radius, height, sides)
     end)
 end
 
+
+local function drawFilledCylinder(x, y, z, radius, height, sides)
+    if not gl.BeginEnd then
+        return
+    end
+
+    local topY = y + height
+    local bottomY = y
+
+    -- Draw the sides (like before)
+    gl.BeginEnd(GL.TRIANGLE_STRIP, function()
+        for i = 0, sides do
+            local angle = (i / sides) * (2 * math.pi)
+            local px = x + radius * math.cos(angle)
+            local pz = z + radius * math.sin(angle)
+
+            -- Bottom vertex
+            gl.Vertex(px, bottomY, pz)
+            -- Top vertex
+            gl.Vertex(px, topY, pz)
+        end
+    end)
+
+    -- Draw bottom circular face
+    gl.BeginEnd(GL.TRIANGLE_FAN, function()
+        gl.Vertex(x, bottomY, z)  -- Center point
+        for i = 0, sides do
+            local angle = (i / sides) * (2 * math.pi)
+            local px = x + radius * math.cos(angle)
+            local pz = z + radius * math.sin(angle)
+            gl.Vertex(px, bottomY, pz)
+        end
+    end)
+
+    -- Draw top circular face
+    gl.BeginEnd(GL.TRIANGLE_FAN, function()
+        gl.Vertex(x, topY, z)  -- Center point
+        for i = sides, 0, -1 do  -- Reverse order to maintain correct winding
+            local angle = (i / sides) * (2 * math.pi)
+            local px = x + radius * math.cos(angle)
+            local pz = z + radius * math.sin(angle)
+            gl.Vertex(px, topY, pz)
+        end
+    end)
+end
+
 local function getPriorityColor(priority)
     -- Higher priority = more red, less other colors
     if priority >= 10 then
-        return {1, 0, 0, 0.4} -- Highest priority: pure red
+        return { 1, 0, 0, 0.4 } -- Highest priority: pure red
     elseif priority >= 8 then
-        return {1, 0.2, 0, 0.4} -- Very high: red-orange
+        return { 1, 0.2, 0, 0.4 } -- Very high: red-orange
     elseif priority >= 6 then
-        return {1, 0.4, 0, 0.4} -- High: orange
+        return { 1, 0.4, 0, 0.4 } -- High: orange
     elseif priority >= 4 then
-        return {1, 0.7, 0, 0.4} -- Medium: yellow-orange
+        return { 1, 0.7, 0, 0.4 } -- Medium: yellow-orange
     else
-        return {0.7, 0.7, 0.7, 0.4} -- Low priority: gray
+        return { 0.7, 0.7, 0.7, 0.4 } -- Low priority: gray
     end
 end
 
@@ -627,10 +893,21 @@ local function getPriorityRadius(priority)
     return 3 + (priority * 2)
 end
 
+local function drawCircle(x, y, z, radius)
+    gl.PushMatrix()
+    gl.Translate(x, y, z)
+    gl.Scale(radius, radius, radius)
+    gl.CallList(circleList)
+    gl.PopMatrix()
+end
+
+
 -- Modified DrawWorld function to show cylinders for all tracked commanders and spybots
 function widget:DrawWorld()
     -- Check if the gl functions we need are available
-    if not gl then return end
+    if not gl then
+        return
+    end
 
     -- Verify all required functions exist before using them
     if not (gl.PushMatrix and gl.PopMatrix and gl.Translate and gl.Color and
@@ -649,7 +926,7 @@ function widget:DrawWorld()
 
             if x and y and z then
                 -- Update the stored position with the latest
-                data.lastPosition = {x = x, y = y, z = z}
+                data.lastPosition = { x = x, y = y, z = z }
 
                 -- Get ground height
                 y = Spring.GetGroundHeight(x, z)
@@ -663,13 +940,13 @@ function widget:DrawWorld()
                     pulseSpeed = 15 -- Faster pulse for combomb (more urgent)
                     pulseSize = 10 -- Pulse size
                     baseRadius = 25 -- Base cylinder radius
-                    color = {1, 0.2, 0, 0.7} -- Bright orange-red for combomb
+                    color = { 1, 0.2, 0, 0.7 } -- Bright orange-red for combomb
                 else
                     -- Com sacrifice (less interesting)
                     pulseSpeed = 30 -- Slower pulse
                     pulseSize = 5 -- Smaller pulse
                     baseRadius = 15 -- Smaller base radius
-                    color = {0.5, 0.5, 1, 0.6} -- Blue for sacrifice
+                    color = { 0.5, 0.5, 1, 0.6 } -- Blue for sacrifice
                 end
 
                 -- Calculate pulsing effect
@@ -692,7 +969,7 @@ function widget:DrawWorld()
 
             if x and y and z then
                 -- Update the stored position
-                data.position = {x = x, y = y, z = z}
+                data.position = { x = x, y = y, z = z }
 
                 -- Get ground height
                 y = Spring.GetGroundHeight(x, z)
@@ -705,19 +982,19 @@ function widget:DrawWorld()
                     pulseSpeed = 10 -- Very fast pulse (most urgent)
                     pulseSize = 12 -- Large pulse
                     baseRadius = 20 -- Large base radius
-                    color = {1, 0, 0, 0.8} -- Pure red for antinuke attack
+                    color = { 1, 0, 0, 0.8 } -- Pure red for antinuke attack
                 elseif data.hasEnemiesNearby then
                     -- Spybot targeting enemies (high interest)
                     pulseSpeed = 15 -- Fast pulse
                     pulseSize = 8 -- Medium pulse
                     baseRadius = 15 -- Medium base radius
-                    color = {1, 0.3, 0, 0.7} -- Orange-red for enemy attack
+                    color = { 1, 0.3, 0, 0.7 } -- Orange-red for enemy attack
                 else
                     -- Regular spybot self-destruct
                     pulseSpeed = 25 -- Slower pulse
                     pulseSize = 5 -- Smaller pulse
                     baseRadius = 10 -- Smaller base radius
-                    color = {0.3, 0.3, 1, 0.5} -- Blue for non-tactical
+                    color = { 0.3, 0.3, 1, 0.5 } -- Blue for non-tactical
                 end
 
                 -- Calculate pulsing effect
@@ -743,7 +1020,7 @@ function widget:DrawWorld()
 
             if x and y and z then
                 -- Update the stored position
-                data.position = {x = x, y = y, z = z}
+                data.position = { x = x, y = y, z = z }
 
                 -- Get ground height
                 y = Spring.GetGroundHeight(x, z)
@@ -752,7 +1029,7 @@ function widget:DrawWorld()
                 local pulseSpeed = 40 -- Slower pulse (less urgent than self-destruct)
                 local pulseSize = 6 -- Medium pulse
                 local baseRadius = 15 -- Medium radius
-                local color = {1, 0.7, 0, 0.6} -- Yellow-orange for spybot near antinuke
+                local color = { 1, 0.7, 0, 0.6 } -- Yellow-orange for spybot near antinuke
 
                 -- Calculate pulsing effect
                 local pulseFactor = math.sin(gameFrame / pulseSpeed) * 0.5 + 0.5
@@ -770,6 +1047,64 @@ function widget:DrawWorld()
         end
     end
 
+    -- Draw nuclear missiles in flight
+    for nukeID, data in pairs(activeNukes) do
+        -- Get the current interpolated position
+        local currentPos = data.currentPosition
+        if currentPos then
+            local x, y, z = currentPos.x, currentPos.y, currentPos.z
+            local targetX, targetZ = data.targetPosition.x, data.targetPosition.z
+            local targetY = Spring.GetGroundHeight(targetX, targetZ)
+
+            -- Different visualization based on whether nuke will be intercepted
+            local pulseSpeed, color, baseRadius, pulseSize
+
+            if data.isCovered then
+                -- Nuke that will be intercepted (less interesting)
+                pulseSpeed = 30 -- Slower pulse
+                pulseSize = 6 -- Smaller pulse
+                baseRadius = 5 -- Smaller radius
+                color = { 0.2, 0.7, 1, 0.6 } -- Blue for intercepted nuke
+            else
+                -- Nuke that won't be intercepted (high interest)
+                pulseSpeed = 10 -- Very fast pulse (most urgent)
+                pulseSize = 15 -- Large pulse
+                baseRadius = 25 -- Large radius
+                color = { 1, 0, 0, 0.8 } -- Bright red for dangerous nuke
+            end
+
+            -- Calculate pulsing effect
+            local pulseFactor = math.sin(gameFrame / pulseSpeed) * 0.5 + 0.5
+            local radius = baseRadius + (pulseSize * pulseFactor)
+
+            -- Draw pulsing cylinder at nuke position
+            --gl.PushMatrix()
+            --gl.Color(color[1], color[2], color[3], color[4])
+            --drawCylinder(x, y, z, radius, 1000, 16)
+            --gl.PopMatrix()
+
+            -- Draw target indicator
+            if not data.isCovered then
+                -- Only draw target indicator for undefended nukes
+                --local targetRadius = 30 + (pulseFactor * 15) -- Larger radius for target indicator
+                --gl.PushMatrix()
+                --gl.Color(1, 0, 0, 0.5) -- Red for impact point
+                --drawFilledCylinder(targetX, targetY, targetZ, 500, 100, 24)
+                --gl.PopMatrix()
+
+                -- Draw a line connecting missile to target
+                --gl.PushMatrix()
+                --gl.Color(1, 0, 0, 0.3) -- Red with transparency
+                --gl.LineWidth(3.0)
+                --gl.BeginEnd(GL.LINES, function()
+                --    gl.Vertex(x, y, z)
+                --    gl.Vertex(targetX, targetY + 50, targetZ)
+                --end)
+                --gl.PopMatrix()
+            end
+        end
+    end
+
     -- Draw critical health commanders
     for unitID, _ in pairs(criticalHealthCommanders) do
         if commanderUnits[unitID] and not selfDestructingCommanders[unitID] then
@@ -778,7 +1113,7 @@ function widget:DrawWorld()
 
             if x and y and z then
                 -- Update the stored position with the latest
-                data.lastPosition = {x = x, y = y, z = z}
+                data.lastPosition = { x = x, y = y, z = z }
 
                 -- Get ground height
                 y = Spring.GetGroundHeight(x, z)
@@ -787,7 +1122,7 @@ function widget:DrawWorld()
                 local pulseSpeed = 20
                 local baseRadius = 20
                 local pulseSize = 8
-                local color = {1, 0, 0, 0.7} -- Bright red for critical
+                local color = { 1, 0, 0, 0.7 } -- Bright red for critical
 
                 -- Calculate pulsing effect
                 local pulseFactor = math.sin(gameFrame / pulseSpeed) * 0.5 + 0.5
@@ -810,7 +1145,7 @@ function widget:DrawWorld()
 
             if x and y and z then
                 -- Update the stored position with the latest
-                data.lastPosition = {x = x, y = y, z = z}
+                data.lastPosition = { x = x, y = y, z = z }
 
                 -- Get ground height
                 y = Spring.GetGroundHeight(x, z)
@@ -819,7 +1154,7 @@ function widget:DrawWorld()
                 local pulseSpeed = 35
                 local baseRadius = 15
                 local pulseSize = 5
-                local color = {1, 0.5, 0, 0.6} -- Orange for low health
+                local color = { 1, 0.5, 0, 0.6 } -- Orange for low health
 
                 -- Calculate pulsing effect
                 local pulseFactor = math.sin(gameFrame / pulseSpeed) * 0.5 + 0.5
@@ -842,6 +1177,7 @@ function widget:DrawWorld()
                 selfDestructingCommanders[event.unitID] or
                         selfDestructingSpybots[event.unitID] or
                         spybotsNearAntinuke[event.unitID] or
+                        activeNukes[event.unitID] or
                         lowHealthCommanders[event.unitID] or
                         criticalHealthCommanders[event.unitID]
         )
@@ -861,30 +1197,44 @@ function widget:DrawWorld()
                     event.type == "SPYBOT_ANTINUKE_DESTROYED" or
                     event.type == "SPYBOT_ENEMIES_DESTROYED" or
                     event.type == "SPYBOT_ANTINUKE_ATTACK" or
-                    event.type == "SPYBOT_NEAR_ANTINUKE_NOTIFICATION"
+                    event.type == "SPYBOT_NEAR_ANTINUKE_NOTIFICATION" or
+                    event.type == "NUKE_LAUNCH_UNDEFENDED" or
+                    event.type == "NUKE_DETONATION"
 
             -- Determine cylinder attributes based on event type
             if event.type == "COMMANDER_DESTROYED" then
-                color = {0.7, 0, 0, 0.8} -- Dark red for destroyed
+                color = { 0.7, 0, 0, 0.8 } -- Dark red for destroyed
                 radius = radius * 1.1 -- Slightly larger
             elseif event.type == "COMMANDER_SELF_DESTRUCTED" then
-                color = {0.9, 0.1, 0.1, 0.8} -- Bright red for self-destruct
+                color = { 0.9, 0.1, 0.1, 0.8 } -- Bright red for self-destruct
                 radius = radius * 1.3 -- Even larger
             elseif event.type == "SPYBOT_ANTINUKE_DESTROYED" then
-                color = {1, 0, 0, 0.9} -- Bright red for antinuke destruction
+                color = { 1, 0, 0, 0.9 } -- Bright red for antinuke destruction
                 radius = radius * 1.2 -- Larger for importance
             elseif event.type == "SPYBOT_ENEMIES_DESTROYED" then
-                color = {1, 0.3, 0, 0.8} -- Orange-red for enemy destruction
+                color = { 1, 0.3, 0, 0.8 } -- Orange-red for enemy destruction
                 radius = radius * 1.1 -- Slightly larger
             elseif event.type == "SPYBOT_ANTINUKE_ATTACK" then
-                color = {1, 0, 0, 0.7} -- Bright red for antinuke targeting
+                color = { 1, 0, 0, 0.7 } -- Bright red for antinuke targeting
                 radius = radius * 1.2 -- Larger for importance
             elseif event.type == "SPYBOT_ENEMY_ATTACK" then
-                color = {1, 0.4, 0, 0.7} -- Orange-red for enemy targeting
+                color = { 1, 0.4, 0, 0.7 } -- Orange-red for enemy targeting
                 radius = radius * 1.1 -- Slightly larger
             elseif event.type == "SPYBOT_NEAR_ANTINUKE_NOTIFICATION" then
-                color = {1, 0.7, 0, 0.6} -- Yellow-orange for spybot near antinuke notification
+                color = { 1, 0.7, 0, 0.6 } -- Yellow-orange for spybot near antinuke notification
                 radius = radius * 1.0 -- Standard size
+            elseif event.type == "NUKE_LAUNCH_DETECTED" then
+                color = { 0.2, 0.7, 1, 0.5 } -- Blue for defended nuke launch
+                radius = radius * 1.0 -- Standard size
+            elseif event.type == "NUKE_LAUNCH_UNDEFENDED" then
+                color = { 1, 0, 0, 0.7 } -- Bright red for undefended nuke launch
+                radius = radius * 1.5 -- Larger for importance
+            elseif event.type == "NUKE_DETONATION" then
+                color = { 1, 0, 0, 0.8 } -- Bright red for nuke detonation
+                radius = radius * 2.0 -- Much larger for critical impact
+            elseif event.type == "NUKE_INTERCEPTED" then
+                color = { 0.2, 0.6, 0.9, 0.5 } -- Blue for intercepted nuke
+                radius = radius * 0.8 -- Smaller for less importance
             end
 
             -- Add pulsing effect if needed
