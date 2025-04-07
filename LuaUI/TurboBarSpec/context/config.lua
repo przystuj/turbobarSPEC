@@ -11,8 +11,8 @@ if not WG.TurboBarSpec.CONFIG then
         },
         EVENTS = {
             COMMANDER = {
-                LOW_HEALTH_THRESHOLD = 0.4, -- Percentage of health before raising alert
-                CRITICAL_HEALTH_THRESHOLD = 0.2, -- Percentage for critical alert
+                LOW_HEALTH_THRESHOLD = 0.5, -- Percentage of health before raising alert
+                CRITICAL_HEALTH_THRESHOLD = 0.35, -- Percentage for critical alert
             }
         }
     }
